@@ -1,5 +1,5 @@
 # Propulsion Prediction
-- Before cloning the repo, install git large file system ([LFS][https://git-lfs.com/])
+- Before cloning the repo, install git large file system ([LFS](https://git-lfs.com/))
 - Use the command:
 ```
 git lfs install
