@@ -372,8 +372,242 @@ class PropulsionDataModule:
         return len(self.feature_columns)
 
 
+class CombinedDataModule:
+    """
+    Data module for training on combined synthetic + real data.
+    
+    Loads training data from both synthetic and real directories,
+    but keeps separate dev sets for evaluation on each domain.
+    
+    All transformations are fit exclusively on combined training data.
+    """
+    
+    def __init__(self, config: DataConfig = None):
+        self.config = config or default_config.data
+        
+        self.feature_engineer = FeatureEngineer()
+        self.feature_scaler = DataScaler()
+        self.target_scaler = TargetScaler()
+        
+        # Data storage
+        self.train_df: Optional[pd.DataFrame] = None
+        self.val_df: Optional[pd.DataFrame] = None
+        
+        # Separate dev sets for each domain
+        self.synthetic_dev_in_df: Optional[pd.DataFrame] = None
+        self.synthetic_dev_out_df: Optional[pd.DataFrame] = None
+        self.real_dev_in_df: Optional[pd.DataFrame] = None
+        self.real_dev_out_df: Optional[pd.DataFrame] = None
+        
+        self.feature_columns: List[str] = []
+        self.is_setup = False
+        
+        # Track data sources
+        self.synthetic_train_size = 0
+        self.real_train_size = 0
+    
+    def _load_csv(self, filepath: str) -> pd.DataFrame:
+        """Load a CSV file and set index."""
+        df = pd.read_csv(filepath)
+        df.set_index(self.config.index_column, inplace=True, drop=True)
+        df.sort_index(inplace=True)
+        return df
+    
+    def setup(self, synthetic_dir: str = "data/synthetic_data", real_dir: str = "data/real_data"):
+        """
+        Load and preprocess data from both synthetic and real sources.
+        
+        Args:
+            synthetic_dir: Path to synthetic data directory
+            real_dir: Path to real data directory
+        
+        The preprocessing pipeline:
+        1. Load raw data from both sources
+        2. Combine training data
+        3. Apply feature engineering (same transformations for all splits)
+        4. Split combined training data into train/val
+        5. Fit scalers on training split ONLY
+        6. Keep separate dev sets for domain-specific evaluation
+        """
+        # Load synthetic data
+        print("Loading synthetic data...")
+        synthetic_train_path = os.path.join(synthetic_dir, self.config.train_file)
+        synthetic_dev_in_path = os.path.join(synthetic_dir, self.config.dev_in_file)
+        synthetic_dev_out_path = os.path.join(synthetic_dir, self.config.dev_out_file)
+        
+        synthetic_train_df = self._load_csv(synthetic_train_path)
+        self.synthetic_dev_in_df = self._load_csv(synthetic_dev_in_path)
+        self.synthetic_dev_out_df = self._load_csv(synthetic_dev_out_path)
+        
+        self.synthetic_train_size = len(synthetic_train_df)
+        print(f"  Synthetic Train: {self.synthetic_train_size:,} samples")
+        print(f"  Synthetic Dev-in: {len(self.synthetic_dev_in_df):,} samples")
+        print(f"  Synthetic Dev-out: {len(self.synthetic_dev_out_df):,} samples")
+        
+        # Load real data
+        print("\nLoading real data...")
+        real_train_path = os.path.join(real_dir, self.config.train_file)
+        real_dev_in_path = os.path.join(real_dir, self.config.dev_in_file)
+        real_dev_out_path = os.path.join(real_dir, self.config.dev_out_file)
+        
+        real_train_df = self._load_csv(real_train_path)
+        self.real_dev_in_df = self._load_csv(real_dev_in_path)
+        self.real_dev_out_df = self._load_csv(real_dev_out_path)
+        
+        self.real_train_size = len(real_train_df)
+        print(f"  Real Train: {self.real_train_size:,} samples")
+        print(f"  Real Dev-in: {len(self.real_dev_in_df):,} samples")
+        print(f"  Real Dev-out: {len(self.real_dev_out_df):,} samples")
+        
+        # Add source column for tracking (optional, can be useful for analysis)
+        synthetic_train_df['_source'] = 'synthetic'
+        real_train_df['_source'] = 'real'
+        
+        # Combine training data
+        # Reset index to avoid conflicts, then create new unique index
+        synthetic_train_df = synthetic_train_df.reset_index(drop=True)
+        real_train_df = real_train_df.reset_index(drop=True)
+        real_train_df.index = real_train_df.index + len(synthetic_train_df)  # Offset real indices
+        
+        combined_train_df = pd.concat([synthetic_train_df, real_train_df], axis=0)
+        combined_train_df.index.name = 'combined_idx'
+        
+        print(f"\n📊 Combined Training Data: {len(combined_train_df):,} samples")
+        print(f"   ({self.synthetic_train_size:,} synthetic + {self.real_train_size:,} real)")
+        
+        # Feature engineering (same logic applied to all)
+        print("\nApplying feature engineering...")
+        combined_train_df = self.feature_engineer.fit_transform(combined_train_df)
+        self.synthetic_dev_in_df = self.feature_engineer.transform(self.synthetic_dev_in_df)
+        self.synthetic_dev_out_df = self.feature_engineer.transform(self.synthetic_dev_out_df)
+        self.real_dev_in_df = self.feature_engineer.transform(self.real_dev_in_df)
+        self.real_dev_out_df = self.feature_engineer.transform(self.real_dev_out_df)
+        
+        # Determine feature columns (exclude target and source marker)
+        self.feature_columns = [
+            col for col in combined_train_df.columns 
+            if col != self.config.target_column and col != '_source'
+        ]
+        print(f"  Using {len(self.feature_columns)} features")
+        
+        # Split combined training data into train/validation
+        print(f"\nSplitting combined train into train/val ({1-self.config.val_split:.0%}/{self.config.val_split:.0%})...")
+        train_idx, val_idx = train_test_split(
+            combined_train_df.index,
+            test_size=self.config.val_split,
+            random_state=self.config.random_seed
+        )
+        
+        self.train_df = combined_train_df.loc[train_idx]
+        self.val_df = combined_train_df.loc[val_idx]
+        
+        print(f"  Train split: {len(self.train_df):,} samples")
+        print(f"  Val split: {len(self.val_df):,} samples")
+        
+        # Fit scalers on TRAINING SPLIT ONLY
+        print("\nFitting scalers on combined training data only...")
+        train_features = self.train_df[self.feature_columns]
+        train_target = self.train_df[self.config.target_column].values
+        
+        self.feature_scaler.fit(train_features)
+        self.target_scaler.fit(train_target)
+        
+        self.is_setup = True
+        print("\n✓ Combined data module setup complete.")
+    
+    def get_train_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Get scaled combined training data."""
+        self._check_setup()
+        X = self.feature_scaler.transform(self.train_df[self.feature_columns])
+        y = self.target_scaler.transform(self.train_df[self.config.target_column].values)
+        return X, y
+    
+    def get_val_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Get scaled validation data."""
+        self._check_setup()
+        X = self.feature_scaler.transform(self.val_df[self.feature_columns])
+        y = self.target_scaler.transform(self.val_df[self.config.target_column].values)
+        return X, y
+    
+    # Synthetic dev sets
+    def get_synthetic_dev_in_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Get scaled synthetic dev-in data."""
+        self._check_setup()
+        X = self.feature_scaler.transform(self.synthetic_dev_in_df[self.feature_columns])
+        y = self.target_scaler.transform(self.synthetic_dev_in_df[self.config.target_column].values)
+        return X, y
+    
+    def get_synthetic_dev_out_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Get scaled synthetic dev-out data."""
+        self._check_setup()
+        X = self.feature_scaler.transform(self.synthetic_dev_out_df[self.feature_columns])
+        y = self.target_scaler.transform(self.synthetic_dev_out_df[self.config.target_column].values)
+        return X, y
+    
+    # Real dev sets
+    def get_real_dev_in_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Get scaled real dev-in data."""
+        self._check_setup()
+        X = self.feature_scaler.transform(self.real_dev_in_df[self.feature_columns])
+        y = self.target_scaler.transform(self.real_dev_in_df[self.config.target_column].values)
+        return X, y
+    
+    def get_real_dev_out_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Get scaled real dev-out data."""
+        self._check_setup()
+        X = self.feature_scaler.transform(self.real_dev_out_df[self.feature_columns])
+        y = self.target_scaler.transform(self.real_dev_out_df[self.config.target_column].values)
+        return X, y
+    
+    def get_raw_targets(self, split: str) -> np.ndarray:
+        """Get unscaled target values for a split."""
+        self._check_setup()
+        split_map = {
+            'train': self.train_df,
+            'val': self.val_df,
+            'synthetic_dev_in': self.synthetic_dev_in_df,
+            'synthetic_dev_out': self.synthetic_dev_out_df,
+            'real_dev_in': self.real_dev_in_df,
+            'real_dev_out': self.real_dev_out_df,
+        }
+        if split not in split_map:
+            raise ValueError(f"Unknown split: {split}. Available: {list(split_map.keys())}")
+        return split_map[split][self.config.target_column].values
+    
+    def inverse_transform_predictions(self, y_scaled: np.ndarray) -> np.ndarray:
+        """Convert scaled predictions back to original scale (kW)."""
+        return self.target_scaler.inverse_transform(y_scaled)
+    
+    def _check_setup(self):
+        if not self.is_setup:
+            raise RuntimeError("CombinedDataModule not set up. Call setup() first.")
+    
+    def save_scalers(self, directory: str):
+        """Save fitted scalers for later use."""
+        os.makedirs(directory, exist_ok=True)
+        self.feature_scaler.save(os.path.join(directory, 'feature_scaler.joblib'))
+        self.target_scaler.save(os.path.join(directory, 'target_scaler.joblib'))
+        print(f"Scalers saved to {directory}")
+    
+    def load_scalers(self, directory: str):
+        """Load previously fitted scalers."""
+        self.feature_scaler = DataScaler.load(
+            os.path.join(directory, 'feature_scaler.joblib')
+        )
+        self.target_scaler = TargetScaler.load(
+            os.path.join(directory, 'target_scaler.joblib')
+        )
+        print(f"Scalers loaded from {directory}")
+    
+    @property
+    def n_features(self) -> int:
+        """Number of input features."""
+        return len(self.feature_columns)
+
+
 if __name__ == "__main__":
     # Quick test
+    print("Testing PropulsionDataModule...")
     dm = PropulsionDataModule()
     dm.setup()
     
@@ -383,4 +617,13 @@ if __name__ == "__main__":
     print(f"\nTrain shape: X={X_train.shape}, y={y_train.shape}")
     print(f"Val shape: X={X_val.shape}, y={y_val.shape}")
     print(f"Feature columns: {dm.feature_columns}")
+    
+    # Test combined module
+    print("\n" + "="*60)
+    print("Testing CombinedDataModule...")
+    cdm = CombinedDataModule()
+    cdm.setup(synthetic_dir="data/synthetic_data", real_dir="data/real_data")
+    
+    X_train, y_train = cdm.get_train_data()
+    print(f"\nCombined Train shape: X={X_train.shape}, y={y_train.shape}")
 
